@@ -32,6 +32,7 @@ const isPkg = true; // typeof process.pkg !== 'undefined';
 let chromiumPath;
 let enableIncomingMessage = false; // Default: don't save incoming messages
 let enableIncomingMessageMedia = false;
+let enableAntiBan = false;
 
 if (isPkg) {
     const iniPath = path.join(__dirname, 'MyWhatsappConsole.ini');
@@ -63,6 +64,13 @@ if (isPkg) {
             enableIncomingMessageMedia = true;        
             console.log('Incoming Media Enabled');
         }
+
+        // Parse AntiBan setting
+        const antiBanMatch = iniContent.match(/^AntiBan\s*=\s*(.+)$/im);
+        if (antiBanMatch && antiBanMatch[1].trim().toLowerCase() === 'true') {
+            enableAntiBan = true;        
+            console.log('AntiBan Mode Enabled (queue + typing + sendSeen)');
+        }
     } catch (err) {
         logError(`Failed to read MyWhatsappConsole.ini: ${err.message}`);
     }
@@ -74,8 +82,25 @@ if (isPkg) {
 console.log('Chromium path:', chromiumPath);
 
 let client;
+let isClientReady = false;
+let clientReadyResolve = null;
+
+function waitForClientReady() {
+    if (isClientReady) return Promise.resolve();
+    return new Promise(resolve => { clientReadyResolve = resolve; });
+}
+
+function setClientReady() {
+    isClientReady = true;
+    if (clientReadyResolve) {
+        clientReadyResolve();
+        clientReadyResolve = null;
+    }
+}
 
 function createClient() {
+    isClientReady = false;
+    clientReadyResolve = null;
     if (client) {
         try { client.destroy(); } catch (e) {}
         client = null;
@@ -111,6 +136,7 @@ function createClient() {
 
     client.on('disconnected', reason => {
         console.error('WhatsApp client disconnected:', reason);
+        isClientReady = false;
         setTimeout(() => {
             console.log('Restarting WhatsApp client...');
             createClient();
@@ -121,6 +147,8 @@ function createClient() {
 
     // Listen for Puppeteer browser disconnect and minimize if not authenticated
     client.once('ready', async () => {
+        setClientReady();
+        console.log('Client ready — coda messaggi attiva.');
         try {
             const browser = client.pupBrowser;            
             if (browser) {
@@ -212,29 +240,160 @@ async function resolveAndCacheContact(waClient, chatId) {
     }
 }
 
+// ============================================================
+// MESSAGE QUEUE SYSTEM - Anti-ban: delay + typing + sendSeen
+// ============================================================
+const messageQueue = [];
+let isProcessingQueue = false;
+
+function randomDelay(minMs, maxMs) {
+    return Math.floor(Math.random() * (maxMs - minMs + 1)) + minMs;
+}
+
+function sleep(ms) {
+    return new Promise(resolve => setTimeout(resolve, ms));
+}
+
+async function simulateTyping(chatId, durationMs) {
+    try {
+        // sendSeen — segna i messaggi come letti
+        try {
+            await client.sendSeen(chatId);
+        } catch (e) {
+            console.warn('⚠️ sendSeen fallito:', e.message);
+        }
+
+        // Ottieni la chat per sendStateTyping
+        let chat;
+        try {
+            chat = await client.getChatById(chatId);
+        } catch (e) {
+            console.warn('⚠️ getChatById fallito:', e.message);
+            // fallback: aspetta senza typing
+            await sleep(durationMs);
+            return;
+        }
+        if (!chat) {
+            await sleep(durationMs);
+            return;
+        }
+
+        // Simula typing a intervalli durante il delay
+        const typingInterval = 4000;
+        const startTime = Date.now();
+
+        while (Date.now() - startTime < durationMs) {
+            try {
+                await chat.sendStateTyping();
+            } catch (e) {
+                console.warn('⚠️ sendStateTyping fallito:', e.message);
+            }
+            const remaining = durationMs - (Date.now() - startTime);
+            if (remaining <= 0) break;
+            await sleep(Math.min(typingInterval, remaining));
+        }
+
+        try {
+            await chat.clearState();
+        } catch (e) {
+            console.warn('⚠️ clearState fallito:', e.message);
+        }
+    } catch (err) {
+        console.warn('⚠️ Errore simulazione typing:', err.message);
+    }
+}
+
+function enqueueMessage(job) {
+    messageQueue.push(job);
+    console.log(`📨 Messaggio accodato per ${job.chatId} (coda: ${messageQueue.length})`);
+    processQueue();
+}
+
+async function processQueue() {
+    if (isProcessingQueue) return;
+    isProcessingQueue = true;
+
+    while (messageQueue.length > 0) {
+        // Attendi che il client sia pronto
+        if (!isClientReady) {
+            console.log('⏸️ Client non pronto, attendo ready...');
+            await waitForClientReady();
+            console.log('▶️ Client pronto, riprendo...');
+        }
+
+        const job = messageQueue.shift();
+
+        try {
+            // Risolvi il contatto una volta
+            let resolvedChatId;
+            try {
+                resolvedChatId = await resolveAndCacheContact(client, job.chatId);
+            } catch (e) {
+                console.warn('⚠️ Resolve contatto fallito, uso ID originale:', e.message);
+                resolvedChatId = job.chatId;
+            }
+
+            // Delay casuale 20-40 secondi
+            const delayMs = randomDelay(20000, 40000);
+            console.log(`⏳ Delay ${(delayMs / 1000).toFixed(1)}s per ${resolvedChatId}...`);
+
+            // Simula typing durante il delay
+            await simulateTyping(resolvedChatId, delayMs);
+
+            // Invia il messaggio passando l'ID risolto
+            await job.sendFn(resolvedChatId);
+            console.log(`✅ Messaggio inviato a ${resolvedChatId}`);
+        } catch (error) {
+            console.error(`❌ Errore invio a ${job.chatId}:`, error.message || error);
+            logError(error);
+        }
+    }
+
+    isProcessingQueue = false;
+}
+
 // Route to send text messages
 app.post('/send-text-message', async (req, res) => {
     const { from, body } = req.body;
-    if (from && body) {
+    if (!from || !body) return res.status(400).send('Invalid request');
+
+    if (enableAntiBan) {
+        enqueueMessage({
+            chatId: from,
+            sendFn: async (resolvedId) => {
+                await client.sendMessage(resolvedId, body);
+            }
+        });
+        res.status(200).send('Message queued');
+    } else {
         try {
-            const validFrom = await resolveAndCacheContact(client, from); 
+            const validFrom = await resolveAndCacheContact(client, from);
             await client.sendMessage(validFrom, body);
             res.status(200).send('Message event triggered');
         } catch (error) {
             logError(error);
             res.status(500).send('Error sending text message');
         }
-    } else {
-        res.status(400).send('Invalid request');
     }
 });
 
 // Route to send media messages
 app.post('/send-media-message', async (req, res) => {
     const { from, data, filename, filesize, mimetype } = req.body;
-    if (from && data && mimetype) {
+    if (!from || !data || !mimetype) return res.status(400).send('Invalid request');
+
+    if (enableAntiBan) {
+        enqueueMessage({
+            chatId: from,
+            sendFn: async (resolvedId) => {
+                const media = new MessageMedia(mimetype, data, filename, filesize);
+                await client.sendMessage(resolvedId, media);
+            }
+        });
+        res.status(200).send('Media message queued');
+    } else {
         try {
-            const validFrom = await resolveAndCacheContact(client, from); 
+            const validFrom = await resolveAndCacheContact(client, from);
             const media = new MessageMedia(mimetype, data, filename, filesize);
             await client.sendMessage(validFrom, media);
             res.status(200).send('Media message sent');
@@ -242,43 +401,60 @@ app.post('/send-media-message', async (req, res) => {
             logError(error);
             res.status(500).send('Error sending media message');
         }
-    } else {
-        res.status(400).send('Invalid request');
     }
 });
 
-// New route to send text, media, or both
+// Route to send text, media, or both
 app.post('/send-message', async (req, res) => {
     const { from, text, data, filename, filesize, mimetype } = req.body;
+    if (!from) return res.status(400).send('Invalid request: "from" is required');
+    if (!text && !(data && mimetype)) return res.status(400).send('Invalid request: "text" or "data" and "mimetype" are required');
 
-    if (!from) {
-        return res.status(400).send('Invalid request: "from" is required');
-    }
-
-    try {
-        const validFrom = await resolveAndCacheContact(client, from);
-
-        if (text && data && mimetype) {
-            // Send both text and media
-            const media = new MessageMedia(mimetype, data, filename, filesize);
-            await client.sendMessage(validFrom, text);
-            await client.sendMessage(validFrom, media);
-        } else if (text) {
-            // Send text only
-            await client.sendMessage(validFrom, text);
-        } else if (data && mimetype) {
-            // Send media only
-            const media = new MessageMedia(mimetype, data, filename, filesize);
-            await client.sendMessage(validFrom, media);
-        } else {
-            return res.status(400).send('Invalid request: "text" or "data" and "mimetype" are required');
+    if (enableAntiBan) {
+        enqueueMessage({
+            chatId: from,
+            sendFn: async (resolvedId) => {
+                if (text && data && mimetype) {
+                    const media = new MessageMedia(mimetype, data, filename, filesize);
+                    await client.sendMessage(resolvedId, text);
+                    await sleep(randomDelay(1500, 3000));
+                    await client.sendMessage(resolvedId, media);
+                } else if (text) {
+                    await client.sendMessage(resolvedId, text);
+                } else {
+                    const media = new MessageMedia(mimetype, data, filename, filesize);
+                    await client.sendMessage(resolvedId, media);
+                }
+            }
+        });
+        res.status(200).send('Message queued');
+    } else {
+        try {
+            const validFrom = await resolveAndCacheContact(client, from);
+            if (text && data && mimetype) {
+                const media = new MessageMedia(mimetype, data, filename, filesize);
+                await client.sendMessage(validFrom, text);
+                await client.sendMessage(validFrom, media);
+            } else if (text) {
+                await client.sendMessage(validFrom, text);
+            } else {
+                const media = new MessageMedia(mimetype, data, filename, filesize);
+                await client.sendMessage(validFrom, media);
+            }
+            res.status(200).send('Message sent');
+        } catch (error) {
+            logError(error);
+            res.status(500).send('Error sending message');
         }
-
-        res.status(200).send('Message sent');
-    } catch (error) {
-        logError(error);
-        res.status(500).send('Error sending message');
     }
+});
+
+// Route per verificare lo stato della coda
+app.get('/queue-status', (req, res) => {
+    res.json({
+        queueLength: messageQueue.length,
+        isProcessing: isProcessingQueue
+    });
 });
 
 client.on('message', async msg => {
